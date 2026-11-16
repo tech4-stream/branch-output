@@ -2,23 +2,40 @@ name: Security Agent
 
 # Triggers Cursor's Security Cloud Agent via API in two modes:
 #   1. PR mode — Dependabot/dep-labeled PR → workflow waits + posts report
-#   2. Cron mode — weekly Mondays 06:00 UTC, sandbox creates fix PRs/issues
+#   2. Cron mode — weekly audit, sandbox creates fix PRs/issues
 # (Cursor sandbox can create new PRs/issues but cannot comment on existing
 #  PRs, so PR-mode requires the workflow to post the report itself.)
+#
+# The weekly run is NOT self-scheduled here — that would fire on every managed
+# repo at the same instant and trip Cursor's concurrent-agent limit. Instead
+# the template's weekly-security-dispatch.yml triggers this via workflow_dispatch,
+# staggered and throttled under the limit. (cron-mode still runs on dispatch.)
 
 on:
   pull_request:
     types: [opened, synchronize, labeled]
-  schedule:
-    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 jobs:
   # Gate the agent on CURSOR_API_KEY being present. Secrets can't be used in
   # job-level `if:`, so we surface presence as an output here and skip cleanly
   # (neutral, not failed) on repos that haven't set the key.
+  #
+  # The guard carries the same event filter as the job(s) it gates, so it only
+  # runs when an agent would actually start. A job that runs bills at least one
+  # full Actions minute, even for this 2-second check; a skipped job bills
+  # nothing. Without the filter the guard alone cost one minute per PR push,
+  # label or CI completion in every managed repo. Keep both filters in sync.
   guard:
     name: Check Cursor API key
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' || (
+        github.event_name == 'pull_request' && (
+          github.event.pull_request.user.login == 'dependabot[bot]' ||
+          contains(github.event.pull_request.labels.*.name, 'dependencies')
+        )
+      )
     runs-on: ubuntu-latest
     outputs:
       has_key: ${{ steps.check.outputs.has_key }}
@@ -159,6 +176,7 @@ jobs:
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           PROMPT=$(jq -Rs \
@@ -176,9 +194,10 @@ jobs:
           PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
             --arg repo "$REPO" \
+            --arg ref "$DEFAULT_BRANCH" \
             '{
               prompt: { text: $prompt },
-              source: { repository: ("github.com/" + $repo), ref: "main" },
+              source: { repository: ("github.com/" + $repo), ref: $ref },
               target: { autoCreatePr: true, openAsCursorGithubApp: true },
               model: "composer-2.5"
             }')
